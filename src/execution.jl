@@ -359,19 +359,20 @@ function _rocfunction(source::FunctionSpec; device=default_device(), queue=defau
         gbl_ptr = Base.unsafe_convert(Ptr{Int64}, gbl)
         Base.unsafe_store!(gbl_ptr, 0)
 
-        # initialize exception ring buffer
-        @assert any(x->x[1]==:__global_exception_ring, globals)
-        gbl = get_global(exe, :__global_exception_ring)
-        gbl_ptr = Base.unsafe_convert(Ptr{Ptr{ExceptionEntry}}, gbl)
-        ex_ptr = Base.unsafe_convert(Ptr{ExceptionEntry}, mod.exceptions)
-        unsafe_store!(gbl_ptr, ex_ptr)
-        # setup initial slots
-        for i in 1:MAX_EXCEPTIONS-1
-            unsafe_store!(ex_ptr, ExceptionEntry(0))
-            ex_ptr += sizeof(ExceptionEntry)
+        if any(x->x[1]==:__global_exception_ring, globals)
+            # initialize exception ring buffer
+            gbl = get_global(exe, :__global_exception_ring)
+            gbl_ptr = Base.unsafe_convert(Ptr{Ptr{ExceptionEntry}}, gbl)
+            ex_ptr = Base.unsafe_convert(Ptr{ExceptionEntry}, mod.exceptions)
+            unsafe_store!(gbl_ptr, ex_ptr)
+            # setup initial slots
+            for i in 1:MAX_EXCEPTIONS-1
+                unsafe_store!(ex_ptr, ExceptionEntry(0))
+                ex_ptr += sizeof(ExceptionEntry)
+            end
+            # setup tail slot
+            unsafe_store!(ex_ptr, ExceptionEntry(1))
         end
-        # setup tail slot
-        unsafe_store!(ex_ptr, ExceptionEntry(1))
     end
 
     # initialize malloc hostcall
