@@ -1,8 +1,31 @@
 export HostCall, hostcall!
 
-const SENTINEL_COUNTER = Ref{Int}(2)
-const SENTINEL_LOCK = ReentrantLock()
 const DEFAULT_HOSTCALL_LATENCY = 0.01
+
+## Sentinels in order of execution
+
+"Signal is ready for accessing by host or device."
+const READY_SENTINEL = 0
+
+"Device has locked the signal."
+const DEVICE_LOCK_SENTINEL = 1
+
+"Device-sourced message is available."
+const DEVICE_MSG_SENTINEL = 2
+
+"Host has locked the signal."
+const HOST_LOCK_SENTINEL = 3
+
+"Host-sourced message is available."
+const HOST_MSG_SENTINEL = 4
+
+## Error sentinels
+
+"Fatal error on device wavefront accessing the signal."
+const DEVICE_ERR_SENTINEL = 5
+
+"Fatal error on host thread accessing the signal."
+const HOST_ERR_SENTINEL = 6
 
 """
     HostCall{S,RT,AT}
@@ -11,35 +34,23 @@ GPU-compatible struct for making hostcalls.
 """
 struct HostCall{S,RT,AT}
     signal::S
-    host_sentinel::Int
-    device_sentinel::Int
     buf_ptr::DevicePtr{UInt8,AS.Global}
     buf_len::UInt
 end
 function HostCall(RT::Type, AT::Type{<:Tuple}, signal::S;
                     agent=get_default_agent()) where S
     @assert S == UInt64
-    # TODO: Just use atomic_add!
-    host_sentinel, device_sentinel = lock(SENTINEL_LOCK) do
-        host_sentinel = SENTINEL_COUNTER[]
-        SENTINEL_COUNTER[] += 1
-        device_sentinel = SENTINEL_COUNTER[]
-        SENTINEL_COUNTER[] += 1
-        if SENTINEL_COUNTER[] > typemax(Int64)-2
-            SENTINEL_COUNTER[] = 2
-            @debug "Sentinel counter wrapped around!"
-        end
-        return host_sentinel, device_sentinel
-    end
     buf_len = 0
     for T in AT.parameters
         @assert isbitstype(T) "Hostcall arguments must be bits-type"
         buf_len += sizeof(T)
     end
-    buf_len = max(sizeof(UInt64), buf_len) # make room for return buffer pointer
-    buf = Mem.alloc(agent, buf_len; coherent=true)
+    buf_size = max(sizeof(UInt64), buf_size) # make room for return buffer pointer
+    buf = Mem.alloc(agent, buf_size)
     buf_ptr = DevicePtr{UInt8,AS.Global}(Base.unsafe_convert(Ptr{UInt8}, buf))
-    HostCall{S,RT,AT}(signal, host_sentinel, device_sentinel, buf_ptr, buf_len)
+    HSA.signal_store_release(HSA.Signal(signal), READY_SENTINEL)
+    memfence!(Val(:seq_cst))
+    HostCall{S,RT,AT}(signal, buf_ptr, buf_size)
 end
 
 ## device signal functions
@@ -91,6 +102,9 @@ end
             entry = BasicBlock(llvm_f, "entry", ctx)
             signal_match = BasicBlock(llvm_f, "signal_match", ctx)
             signal_miss = BasicBlock(llvm_f, "signal_miss", ctx)
+            signal_miss_1 = BasicBlock(llvm_f, "signal_miss_1", ctx)
+            signal_miss_2 = BasicBlock(llvm_f, "signal_miss_2", ctx)
+            signal_fail = BasicBlock(llvm_f, "signal_fail", ctx)
 
             position!(builder, entry)
             br!(builder, signal_miss)
@@ -105,7 +119,19 @@ end
                                                         # __ATOMIC_ACQUIRE == 2
                                                         ConstantInt(Int32(2), ctx)])
             cond = icmp!(builder, LLVM.API.LLVMIntEQ, loaded_value, parameters(llvm_f)[2])
-            br!(builder, cond, signal_match, signal_miss)
+            br!(builder, cond, signal_match, signal_miss_1)
+
+            position!(builder, signal_miss_1)
+            cond = icmp!(builder, LLVM.API.LLVMIntEQ, loaded_value, ConstantInt(Int64(DEVICE_ERR_SENTINEL), ctx))
+            br!(builder, cond, signal_fail, signal_miss_2)
+
+            position!(builder, signal_miss_2)
+            cond = icmp!(builder, LLVM.API.LLVMIntEQ, loaded_value, ConstantInt(Int64(HOST_ERR_SENTINEL), ctx))
+            br!(builder, cond, signal_fail, signal_miss)
+
+            position!(builder, signal_fail)
+            call!(builder, GPUCompiler.Runtime.get(:signal_exception))
+            unreachable!(builder)
 
             position!(builder, signal_match)
             ret!(builder)
@@ -114,37 +140,125 @@ end
         call_function(llvm_f, Nothing, Tuple{UInt64,Int64}, :((signal,value)))
     end
 end
+@inline @generated function device_signal_wait_cas!(signal::UInt64, expected::Int64, value::Int64)
+    JuliaContext() do ctx
+        T_nothing = convert(LLVMType, Nothing, ctx)
+        T_i32 = LLVM.Int32Type(ctx)
+        T_i64 = LLVM.Int64Type(ctx)
+
+        # create a function
+        llvm_f, _ = create_function(T_nothing, [T_i64, T_i64, T_i64])
+        mod = LLVM.parent(llvm_f)
+
+        # generate IR
+        Builder(ctx) do builder
+            entry = BasicBlock(llvm_f, "entry", ctx)
+            signal_match = BasicBlock(llvm_f, "signal_match", ctx)
+            signal_miss = BasicBlock(llvm_f, "signal_miss", ctx)
+            signal_miss_1 = BasicBlock(llvm_f, "signal_miss_1", ctx)
+            signal_miss_2 = BasicBlock(llvm_f, "signal_miss_2", ctx)
+            signal_fail = BasicBlock(llvm_f, "signal_fail", ctx)
+
+            position!(builder, entry)
+            br!(builder, signal_miss)
+
+            position!(builder, signal_miss)
+            T_sleep = LLVM.FunctionType(T_nothing, [T_i32])
+            sleep_f = LLVM.Function(mod, "llvm.amdgcn.s.sleep", T_sleep)
+            call!(builder, sleep_f, [ConstantInt(Int32(1), ctx)])
+            T_signal_cas = LLVM.FunctionType(T_i64, [T_i64, T_i64, T_i64, T_i32])
+            signal_cas = LLVM.Function(mod, "__ockl_hsa_signal_cas", T_signal_cas)
+            loaded_value = call!(builder, signal_cas, [parameters(llvm_f)[1],
+                                                       parameters(llvm_f)[2],
+                                                       parameters(llvm_f)[3],
+                                                       # __ATOMIC_ACQREL == 4
+                                                       ConstantInt(Int32(4), ctx)])
+            cond = icmp!(builder, LLVM.API.LLVMIntEQ, loaded_value, parameters(llvm_f)[2])
+            br!(builder, cond, signal_match, signal_miss_1)
+
+            position!(builder, signal_miss_1)
+            cond = icmp!(builder, LLVM.API.LLVMIntEQ, loaded_value, ConstantInt(Int64(DEVICE_ERR_SENTINEL), ctx))
+            br!(builder, cond, signal_fail, signal_miss_2)
+
+            position!(builder, signal_miss_2)
+            cond = icmp!(builder, LLVM.API.LLVMIntEQ, loaded_value, ConstantInt(Int64(HOST_ERR_SENTINEL), ctx))
+            br!(builder, cond, signal_fail, signal_miss)
+
+            position!(builder, signal_fail)
+            call!(builder, GPUCompiler.Runtime.get(:signal_exception))
+            unreachable!(builder)
+
+            position!(builder, signal_match)
+            ret!(builder)
+        end
+
+        call_function(llvm_f, Nothing, Tuple{UInt64,Int64,Int64}, :((signal,expected,value)))
+    end
+end
 "Calls the host function stored in `hc` with arguments `args`."
-@inline @generated function hostcall!(hc::HostCall{UInt64,RT,AT}, args...) where {RT,AT}
+@inline function hostcall!(hc::HostCall, args...)
+    _hostcall_lock!(hc)
+    _hostcall_write_args!(hc, args...)
+    _hostcall!(hc)
+end
+@generated function _hostcall_lock!(hc::HostCall{UInt64,RT,AT}) where {RT,AT}
+    # Acquire lock on hostcall buffer
+    :($device_signal_wait_cas!(hc.signal, $READY_SENTINEL, $DEVICE_LOCK_SENTINEL))
+end
+@generated function _hostcall_write_args!(hc::HostCall{UInt64,RT,AT}, args...) where {RT,AT}
     ex = Expr(:block)
 
     # Copy arguments into buffer
     # Modified from CUDAnative src/device/cuda/dynamic_parallelism.jl
-    off = 1
-    for i in 1:length(args)
-        T = args[i]
-        sz = sizeof(T)
-        # TODO: Should we do what CUDAnative does instead?
-        ptr = :(Base.unsafe_convert(DevicePtr{$T,AS.Global}, hc.buf_ptr+$off-1))
-        push!(ex.args, :(Base.unsafe_store!($ptr, args[$i])))
-        off += sz
+    if write_args
+        off = 1
+        for i in 1:length(args)
+            T = args[i]
+            sz = sizeof(T)
+            # TODO: Should we do what CUDAnative does instead?
+            ptr = :(Base.unsafe_convert(DevicePtr{$T,AS.Global}, hc.buf_ptr+$off-1))
+            push!(ex.args, :(Base.unsafe_store!($ptr, args[$i])))
+            off += sz
+        end
     end
+
+    ex
+end
+struct HostCallDeviceException end
+@generated function _hostcall!(hc::HostCall{UInt64,RT,AT}) where {RT,AT}
+    ex = Expr(:block)
 
     # Ring the doorbell
-    push!(ex.args, :($device_signal_store!(hc.signal, hc.device_sentinel)))
+    push!(ex.args, quote
+        $memfence!(Val(:seq_cst))
+        # FIXME: $device_signal_wait_cas!(hc.signal, $DEVICE_LOCK_SENTINEL, $DEVICE_MSG_SENTINEL)
+        $device_signal_store!(hc.signal, $DEVICE_MSG_SENTINEL)
+    end)
 
+    @gensym result ptr
     if RT === Nothing
-        # Async hostcall
-        push!(ex.args, :(nothing))
+        # Async hostcall, host will set READY_SENTINEL
+        push!(ex.args, :($result = nothing))
     else
-        # Wait on doorbell (hc.host_sentinel)
-        push!(ex.args, :($device_signal_wait(hc.signal, hc.host_sentinel)))
-        # Get return buffer and load first value
-        ptr = :(Base.unsafe_convert(DevicePtr{DevicePtr{$RT,AS.Global},AS.Global}, hc.buf_ptr))
-        push!(ex.args, :(unsafe_load(unsafe_load($ptr))))
+        push!(ex.args, quote
+            # Wait on host message
+            $device_signal_wait(hc.signal, $HOST_MSG_SENTINEL)
+            # Get return buffer and load first value
+            $memfence!(Val(:seq_cst))
+            $ptr = Base.unsafe_convert(DevicePtr{DevicePtr{$RT,AS.Global},AS.Global}, hc.buf_ptr)
+            $ptr = unsafe_load($ptr)
+            if UInt64($ptr) == 0
+                $device_signal_store!(hc.signal, $DEVICE_ERR_SENTINEL)
+                AMDGPU.signal_exception()
+            end
+            $result = unsafe_load($ptr)::$RT
+            $memfence!(Val(:seq_cst))
+            $device_signal_store!(hc.signal, $READY_SENTINEL)
+        end)
     end
+    push!(ex.args, :($result))
 
-    return ex
+    ex
 end
 
 ## hostcall
@@ -158,9 +272,13 @@ end
         T = AT.parameters[i]
         sz = sizeof(T)
         # TODO: Should we do what CUDAnative does instead?
-        ptr = :(Base.unsafe_convert(DevicePtr{$T,AS.Global}, hc.buf_ptr+$off-1))
-        # FIXME: We should not be using a device intrinsic here, even though it works...
-        push!(ex.args, :(Base.unsafe_load($ptr)))
+        push!(ex.args, quote
+            lref = Ref{$T}()
+            HSA.memory_copy(convert(Ptr{Cvoid}, Base.unsafe_convert(Ptr{$T}, lref)),
+                            convert(Ptr{Cvoid}, Base.unsafe_convert(Ptr{UInt8}, hc.buf_ptr+$(off-1))),
+                            $sz)
+            lref[]
+        end)
         off += sz
     end
 
@@ -169,6 +287,18 @@ end
 
 struct HostCallException <: Exception
     reason::String
+    err::Union{Exception,Nothing}
+    bt::Union{Vector,Nothing}
+end
+HostCallException(reason) = HostCallException(reason, nothing, nothing)
+HostCallException(reason, err) = HostCallException(reason, err, catch_backtrace())
+function Base.showerror(io::IO, err::HostCallException)
+    print(io, "HostCallException")
+    if err.err !== nothing
+        print(io, ":\n")
+        Base.showerror(io, err.err)
+        Base.show_backtrace(io, err.bt)
+    end
 end
 
 """
@@ -189,18 +319,22 @@ function HostCall(func, rettype, argtypes; return_task=false,
 
     tsk = @async begin
         ret_buf = Ref{Mem.Buffer}()
+        ret_len = 0
         try
             while true
                 try
-                    _hostwait(signal.signal[], hc.device_sentinel; maxlat=maxlat)
+                    if !_hostwait(signal.signal[]; maxlat=maxlat)
+                        throw(HostCallException("Hostcall: Device error on signal $(signal.signal[])"))
+                    end
                 catch err
-                    throw(HostCallException("Hostcall: Error during hostwait"))
+                    throw(HostCallException("Hostcall: Error during hostwait", err))
                 end
+                # FIXME: Lock the signal
                 if length(argtypes.parameters) > 0
                     args = try
                         _hostcall_args(hc)
                     catch err
-                        throw(HostCallException("Hostcall: Error getting arguments"))
+                        throw(HostCallException("Hostcall: Error getting arguments", err))
                     end
                     @debug "Hostcall: Got arguments of length $(length(args))"
                 else
@@ -209,9 +343,12 @@ function HostCall(func, rettype, argtypes; return_task=false,
                 ret = try
                     func(args...,)
                 catch err
-                    throw(HostCallException("Hostcall: Error executing host function"))
+                    throw(HostCallException("Hostcall: Error executing host function", err))
                 end
-                rettype === Nothing && return
+                if rettype === Nothing
+                    HSA.signal_store_release(signal.signal[], READY_SENTINEL)
+                    continue
+                end
                 if typeof(ret) != rettype
                     throw(HostCallException("Hostcall: Host function result of wrong type: $(typeof(ret)), expected $rettype"))
                 end
@@ -220,32 +357,37 @@ function HostCall(func, rettype, argtypes; return_task=false,
                 end
                 @debug "Hostcall: Host function returning value of type $(typeof(ret))"
                 try
-                    ret_len = sizeof(ret)
-                    ret_buf = Mem.alloc(agent, ret_len; coherent=true) # FIXME: Don't be coherent
-                    ret_buf_ptr = Base.unsafe_convert(Ptr{typeof(ret)}, ret_buf)
-                    Base.unsafe_store!(ret_buf_ptr, ret)
-                    ret_buf_ptr = Base.unsafe_convert(Ptr{UInt64}, ret_buf)
-                    args_buf_ptr = convert(Ptr{UInt64}, hc.buf_ptr)
-                    Base.unsafe_store!(args_buf_ptr, ret_buf_ptr)
-                    HSA.signal_store_release(signal.signal[], hc.host_sentinel)
+                    if isassigned(ret_buf) && (ret_len != sizeof(ret))
+                        Mem.free(ret_buf[])
+                        ret_len = sizeof(ret)
+                        ret_buf[] = Mem.alloc(agent, ret_len)
+                    elseif !isassigned(ret_buf)
+                        ret_len = sizeof(ret)
+                        ret_buf[] = Mem.alloc(agent, ret_len)
+                    end
+                    ret_ref = Ref{UInt64}(ret)
+                    GC.@preserve ret_ref begin
+                        ret_ptr = convert(Ptr{Cvoid}, Base.unsafe_convert(Ptr{UInt64}, ret_ref))
+                        HSA.memory_copy(Base.unsafe_convert(Ptr{Cvoid}, ret_buf[]), ret_ptr, sizeof(ret))
+                    end
+                    args_buf_ptr = reinterpret(Ptr{Cvoid}, hc.buf_ptr)
+                    HSA.memory_copy(args_buf_ptr, Base.unsafe_convert(Ptr{Cvoid}, ret_buf[]), sizeof(UInt64))
+                    HSA.signal_store_release(signal.signal[], HOST_MSG_SENTINEL)
                 catch err
-                    throw(HostCallException("Hostcall: Error returning hostcall result"))
+                    throw(HostCallException("Hostcall: Error returning hostcall result", err))
                 end
                 @debug "Hostcall: Host function return completed"
                 continuous || break
             end
         catch err
-            @error "Hostcall error" exception=(err,catch_backtrace())
+            Base.showerror(stderr, err)
+            Base.show_backtrace(stderr, catch_backtrace())
             rethrow(err)
         finally
-            # TODO: This is probably a bad idea to free while the kernel might
-            # still hold a reference. We should probably have some way to
-            # reference count these buffers from kernels (other than just
-            # using a ROCArray, which can't currently be serialized to the
-            # GPU).
             if isassigned(ret_buf)
-                Mem.free(ret_buf)
+                Mem.free(ret_buf[])
             end
+            HSA.signal_store_release(signal.signal[], HOST_ERR_SENTINEL)
             Mem.free(hc.buf_ptr)
         end
     end
@@ -260,13 +402,19 @@ end
 # CPU functions
 get_value(hc::HostCall{UInt64,RT,AT} where {RT,AT}) =
     HSA.signal_load_scacquire(HSA.Signal(hc.signal))
-function _hostwait(signal, sentinel; maxlat=DEFAULT_HOSTCALL_LATENCY)
-    @debug "Hostcall: Waiting on signal for sentinel: $sentinel"
+function _hostwait(signal; maxlat=DEFAULT_HOSTCALL_LATENCY)
+    @debug "Hostcall: Waiting on signal $signal"
     while true
-        value = HSA.signal_load_scacquire(signal)
-        if value == sentinel
-            @debug "Hostcall: Signal triggered with sentinel: $sentinel"
-            return
+        prev = HSA.signal_cas_scacq_screl(signal, DEVICE_MSG_SENTINEL, HOST_LOCK_SENTINEL)
+        if prev == DEVICE_MSG_SENTINEL
+            @debug "Hostcall: Device message on signal $signal"
+            return true
+        elseif prev == DEVICE_ERR_SENTINEL
+            @debug "Hostcall: Device error on signal $signal"
+            return false
+        else
+            @debug "Hostcall: Value of $prev on signal $signal"
+            sleep(0.1)
         end
         sleep(maxlat)
     end

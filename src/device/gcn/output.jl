@@ -68,10 +68,11 @@ function rocprint(oc, str, nl::Bool=false)
         if nl && idx == length(str.args)
             arg *= '\n'
         end
+        push!(ex.args, :($device_signal_wait_cas!($(esc(oc)).hostcall.signal, $READY_SENTINEL, $DEVICE_LOCK_SENTINEL)))
         N = rocprint!(ex, 1, oc, arg)
         N = rocprint!(ex, N, oc, '\0')
         dstr = DeviceStaticString{N}()
-        push!(ex.args, :(hostcall!($(esc(oc)).hostcall, $dstr)))
+        push!(ex.args, :(hostcall!($(esc(oc)).hostcall, $dstr; lock=false, write_args=false)))
     end
     push!(ex.args, :(nothing))
     return ex
