@@ -296,7 +296,7 @@ function rocfunction(f::Core.Function, tt::Type=Tuple{}; name=nothing, kwargs...
 end
 
 # actual compilation
-function _rocfunction(source::FunctionSpec; device=default_device(), queue=default_queue(device), global_hooks, kwargs...)
+function _rocfunction(source::FunctionSpec; device=default_device(), queue=default_queue(device), global_hooks=NamedTuple(), kwargs...)
     # compile to GCN
     target = GCNCompilerTarget(; dev_isa=default_isa(device), kwargs...)
     params = ROCCompilerParams()
