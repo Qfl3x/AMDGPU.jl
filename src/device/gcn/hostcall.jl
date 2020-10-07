@@ -38,12 +38,14 @@ struct HostCall{S,RT,AT}
     buf_len::UInt
 end
 function HostCall(RT::Type, AT::Type{<:Tuple}, signal::S;
-                    agent=get_default_agent()) where S
+                  agent=get_default_agent(), buf_size=nothing) where S
     @assert S == UInt64
-    buf_len = 0
-    for T in AT.parameters
-        @assert isbitstype(T) "Hostcall arguments must be bits-type"
-        buf_len += sizeof(T)
+    if buf_size === nothing
+        buf_size = 0
+        for T in AT.parameters
+            @assert isbitstype(T) "Hostcall arguments must be bits-type"
+            buf_size += sizeof(T)
+        end
     end
     buf_size = max(sizeof(UInt64), buf_size) # make room for return buffer pointer
     buf = Mem.alloc(agent, buf_size)
@@ -313,9 +315,9 @@ Note: This API is currently experimental and is subject to change at any time.
 """
 function HostCall(func, rettype, argtypes; return_task=false,
                   agent=get_default_agent(), maxlat=DEFAULT_HOSTCALL_LATENCY,
-                  continuous=false)
+                  continuous=false, buf_size=nothing)
     signal = HSASignal()
-    hc = HostCall(rettype, argtypes, signal.signal[].handle; agent=agent)
+    hc = HostCall(rettype, argtypes, signal.signal[].handle; agent=agent, buf_size=buf_size)
 
     tsk = @async begin
         ret_buf = Ref{Mem.Buffer}()
