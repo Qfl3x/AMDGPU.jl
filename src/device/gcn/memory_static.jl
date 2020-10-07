@@ -62,7 +62,7 @@ end
 end
 
 # TODO: Support various types of len
-@inline @generated function memcpy!(dest_ptr::DevicePtr{UInt8,DestAS}, src_ptr::DevicePtr{UInt8,SrcAS}, len::LT) where {DestAS,SrcAS,LT<:Union{Int64,UInt64}}
+@inline @generated function memcpy!(dest_ptr::DevicePtr{UInt8,DestAS}, src_ptr::DevicePtr{UInt8,SrcAS}, len::LT, ::Val{volatile}) where {DestAS,SrcAS,LT<:Union{Int64,UInt64},volatile}
     JuliaContext() do ctx
         T_nothing = LLVM.VoidType(ctx)
         dest_as = convert(Int, DestAS)
@@ -89,15 +89,15 @@ end
             src_ptr_i64 = inttoptr!(builder, parameters(llvm_f)[2], T_pint64_src)
             src_ptr_i8 = bitcast!(builder, src_ptr_i64, T_pint8_src)
 
-            call!(builder, intr, [dest_ptr_i8, src_ptr_i8, parameters(llvm_f)[3], ConstantInt(T_int1, 0)])
+            call!(builder, intr, [dest_ptr_i8, src_ptr_i8, parameters(llvm_f)[3], ConstantInt(T_int1, volatile)])
             ret!(builder)
         end
         call_function(llvm_f, Nothing, Tuple{DevicePtr{UInt8,DestAS},DevicePtr{UInt8,SrcAS},LT}, :((dest_ptr, src_ptr, len)))
     end
 end
-memcpy!(dest_ptr::DevicePtr{T,DestAS}, src_ptr::DevicePtr{T,SrcAS}, len::Integer) where {T,DestAS,SrcAS} =
-    memcpy!(convert(DevicePtr{UInt8,DestAS}, dest_ptr), convert(DevicePtr{UInt8,SrcAS}, src_ptr), UInt64(len))
-@inline @generated function memset!(dest_ptr::DevicePtr{UInt8,DestAS}, value::UInt8, len::LT) where {DestAS,LT<:Union{Int64,UInt64}}
+memcpy!(dest_ptr::DevicePtr{T,DestAS}, src_ptr::DevicePtr{T,SrcAS}, len::Integer, volatile::Val=Val(false)) where {T,DestAS,SrcAS} =
+    memcpy!(convert(DevicePtr{UInt8,DestAS}, dest_ptr), convert(DevicePtr{UInt8,SrcAS}, src_ptr), UInt64(len), volatile)
+@inline @generated function memset!(dest_ptr::DevicePtr{UInt8,DestAS}, value::UInt8, len::LT, ::Val{volatile}) where {DestAS,LT<:Union{Int64,UInt64},volatile}
     JuliaContext() do ctx
         T_nothing = LLVM.VoidType(ctx)
         dest_as = convert(Int, DestAS)
@@ -118,11 +118,11 @@ memcpy!(dest_ptr::DevicePtr{T,DestAS}, src_ptr::DevicePtr{T,SrcAS}, len::Integer
             dest_ptr_i64 = inttoptr!(builder, parameters(llvm_f)[1], T_pint64_dest)
             dest_ptr_i8 = bitcast!(builder, dest_ptr_i64, T_pint8_dest)
 
-            call!(builder, intr, [dest_ptr_i8, parameters(llvm_f)[2], parameters(llvm_f)[3], ConstantInt(T_int1, 0)])
+            call!(builder, intr, [dest_ptr_i8, parameters(llvm_f)[2], parameters(llvm_f)[3], ConstantInt(T_int1, volatile)])
             ret!(builder)
         end
         call_function(llvm_f, Nothing, Tuple{DevicePtr{UInt8,DestAS},UInt8,LT}, :((dest_ptr, value, len)))
     end
 end
-memset!(dest_ptr::DevicePtr{T,DestAS}, value::UInt8, len::Integer) where {T,DestAS} =
-    memset!(convert(DevicePtr{UInt8,DestAS}, dest_ptr), value, UInt64(len))
+memset!(dest_ptr::DevicePtr{T,DestAS}, value::UInt8, len::Integer, volatile::Val=Val(false)) where {T,DestAS} =
+    memset!(convert(DevicePtr{UInt8,DestAS}, dest_ptr), value, UInt64(len), volatile)
