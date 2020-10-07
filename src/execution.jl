@@ -353,6 +353,20 @@ function _rocfunction(source::FunctionSpec; device=default_device(), queue=defau
         Base.unsafe_store!(gbl_ptr, oc)
     end
 
+    # initialize global printf context
+    if any(x->x[1]==:__global_printf_context, globals)
+        gbl = get_global(exe, :__global_printf_context)
+        # Return type of Int to force synchronizing behavior for @rocprintfw
+        gbl_ptr = Base.unsafe_convert(Ptr{HostCall{UInt64,Int,Tuple{DevicePtr{UInt8,AS.Global}}}}, gbl)
+        hc = HostCall(Int, Tuple{DevicePtr{UInt8,AS.Global}}; agent=device.device, continuous=true, buf_size=2^16) do _
+            fmt, args = unsafe_load(Base.unsafe_convert(DevicePtr{ROCPrintfBuffer,AS.Global}, hc.buf_ptr))
+            @debug "@rocprintf with $fmt and $(args)"
+            @eval @printf($fmt, $(args...))
+            return 0
+        end
+        Base.unsafe_store!(gbl_ptr, hc)
+    end
+
     # initialize global exception flag
     if any(x->x[1]==:__global_exception_flag, globals)
         gbl = get_global(exe, :__global_exception_flag)
