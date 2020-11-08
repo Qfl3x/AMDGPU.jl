@@ -64,7 +64,7 @@ deps = ["AbstractFFTs", "Adapt", "LinearAlgebra", "Printf", "Random", "Serializa
 git-tree-sha1 = "600f45500060894487832c2f00c203fe3e0cb264"
 pinned = true
 uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-version = "5.1.0"
+version = "5.0.0"
 
 [[GPUCompiler]]
 deps = ["DataStructures", "InteractiveUtils", "LLVM", "Libdl", "Scratch", "Serialization", "TimerOutputs", "UUIDs"]
